@@ -1,12 +1,13 @@
 # FFmpeg Batch Convert
 
-A robust Python script for batch converting video files using FFmpeg with HLG (Hybrid Log-Gamma) hardware encoding.
+A robust Python script for batch converting video files using FFmpeg with hardware-accelerated encoding and automatic color profile detection. Converts DLOG-M, HLG, and other formats to REC709 with appropriate color grading.
 
 ## Features
 
 - **Batch Processing**: Automatically processes all MP4/MOV files in a directory
 - **Hardware Acceleration**: Uses VideoToolbox on macOS for efficient encoding
-- **HLG Encoding**: Converts videos to HLG format with proper color space handling
+- **Automatic Color Profile Detection**: Detects DLOG-M, HLG, and REC709 color profiles
+- **Smart LUT Application**: Automatically applies appropriate LUT files for color grading
 - **Progress Tracking**: Real-time progress bars for individual files and overall progress
 - **Comprehensive Logging**: Detailed logs with conversion statistics
 - **Error Handling**: Robust error handling with detailed error messages
@@ -24,9 +25,22 @@ A robust Python script for batch converting video files using FFmpeg with HLG (H
 
 ## Installation
 
+### Option 1: Direct Use
 1. Clone or download this repository
 2. Make sure FFmpeg is installed and accessible from command line
 3. The script is ready to use - no additional Python dependencies required
+
+### Option 2: Install as Package
+```bash
+# Install using uv (recommended)
+uv sync
+
+# Or install using pip
+pip install -e .
+
+# Then run from anywhere
+ffmpeg-batch-convert
+```
 
 ## Usage
 
@@ -59,8 +73,9 @@ python main.py -d /path/to/videos -s _hlg_converted -v
 ### Command Line Options
 
 - `-d, --directory`: Input directory containing video files (default: current directory)
-- `-s, --suffix`: Output file suffix (default: `_HLG_hw`)
-- `-l, --lut`: LUT file for color grading (default: `DJI_DLogM_to_Rec709.cube`)
+- `-o, --output`: Output directory (default: same as input directory)
+- `-s, --suffix`: Output file suffix (default: `_REC709`)
+- `-l, --lut`: Custom LUT file for color grading (auto-selects by default)
 - `-v, --verbose`: Enable verbose logging
 - `-h, --help`: Show help message
 
@@ -85,11 +100,17 @@ The script uses the following FFmpeg configuration:
 
 - **Hardware Acceleration**: VideoToolbox (macOS)
 - **Codec**: HEVC (H.265) with hardware encoding
-- **Pixel Format**: P010LE (10-bit)
+- **Pixel Format**: YUV420P10LE (10-bit)
 - **Bitrate**: 20Mbps with 25Mbps max rate
-- **Color Space**: BT.2020
-- **Transfer Function**: ARIB-STD-B67 (HLG)
+- **Output Color Space**: BT.709 (REC709)
 - **Audio**: Copy without re-encoding
+
+### Color Profile Detection & LUT Application
+
+- **DLOG-M** (DJI footage): Applies `luts/DJI_DLogM_to_Rec709.cube`
+- **HLG** (iPhone footage): Applies `luts/iPhone_2020_to_709_33.cube`
+- **REC709**: No LUT needed, direct encoding
+- **Unknown**: Defaults to DLOG-M LUT
 
 ### File Processing
 
@@ -122,16 +143,23 @@ The script includes comprehensive error handling:
 - Efficient memory usage
 - Parallel-ready architecture (can be extended for concurrent processing)
 
-## Migration from Shell Script
+## Architecture
 
-This Python version provides several improvements over the original shell script:
+The tool is built around a single `VideoConverter` class that handles the entire conversion pipeline:
 
-- **Better Error Handling**: More robust error detection and recovery
-- **Cross-Platform**: Works on macOS, Linux, and Windows
-- **Extensible**: Easy to add new features and options
-- **Maintainable**: Clean, documented code structure
-- **Configurable**: Command-line options for flexibility
-- **Logging**: Comprehensive logging system
+1. **File Discovery**: Scans for video files in the input directory
+2. **Metadata Analysis**: Uses ffprobe to extract color profile information
+3. **Color Profile Detection**: Automatically detects DLOG-M, HLG, or REC709 profiles
+4. **LUT Selection**: Chooses appropriate LUT file based on detected profile
+5. **Hardware-Accelerated Conversion**: Executes FFmpeg with VideoToolbox acceleration
+6. **Progress Monitoring**: Real-time progress parsing and display
+
+### Key Components
+
+- **VideoInfo**: Dataclass storing video metadata (duration, color space, dimensions)
+- **Color Profile Detection**: Analyzes ffprobe metadata to determine source format
+- **FFmpeg Command Builder**: Constructs appropriate FFmpeg commands with LUT filters
+- **Progress Display**: Real-time encoding progress with colored terminal output
 
 ## License
 
