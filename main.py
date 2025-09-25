@@ -6,16 +6,12 @@ import time
 import re
 import argparse
 import logging
+import subprocess
+import json
 from pathlib import Path
 from typing import List, Optional
 from dataclasses import dataclass
 import shutil
-
-try:
-    import ffmpeg
-except ImportError:
-    print("Error: ffmpeg-python not installed. Run: pip install ffmpeg-python")
-    sys.exit(1)
 
 
 @dataclass
@@ -40,27 +36,33 @@ class VideoConverter:
     EXTENSIONS = {'.mp4', '.mov', '.MP4', '.MOV'}
 
     def __init__(self, input_dir: str = ".", output_dir: Optional[str] = None,
-                 output_suffix: str = "_HLG_hw", lut_file: str = "DJI_DLogM_to_Rec709.cube"):
+                 output_suffix: str = "_REC709", lut_file: Optional[str] = None):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir) if output_dir else None
         self.output_suffix = output_suffix
-        self.lut_file = lut_file
+        self.custom_lut_file = lut_file
+
+        # LUT file paths
+        self.dlogm_lut = "luts/DJI_DLogM_to_Rec709.cube"
+        self.hlg_lut = "luts/iPhone_2020_to_709_33.cube"
 
         self.stats = {
             'successful': 0, 'failed': 0,
-            'input_size': 0, 'output_size': 0, 'start_time': 0
+            'input_size': 0, 'output_size': 0, 'start_time': 0.0
         }
 
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[logging.FileHandler('conversion.log'), logging.StreamHandler()]
+            handlers=[logging.FileHandler(
+                'conversion.log'), logging.StreamHandler()]
         )
         self.logger = logging.getLogger(__name__)
 
     def check_dependencies(self) -> bool:
         if not shutil.which('ffmpeg'):
-            print(f"{Colors.RED}Error: ffmpeg not found. Install from https://ffmpeg.org{Colors.NC}")
+            print(
+                f"{Colors.RED}Error: ffmpeg not found. Install from https://ffmpeg.org{Colors.NC}")
             return False
         return True
 
@@ -69,10 +71,12 @@ class VideoConverter:
 
     @staticmethod
     def format_size(size: int) -> str:
+        size_float = float(size)
         for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if size < 1024.0 or unit == 'TB':
-                return f"{size:.1f} {unit}"
-            size /= 1024.0
+            if size_float < 1024.0 or unit == 'TB':
+                return f"{size_float:.1f} {unit}"
+            size_float /= 1024.0
+        return f"{size_float:.1f} TB"
 
     @staticmethod
     def format_duration(seconds: float) -> str:
@@ -82,20 +86,24 @@ class VideoConverter:
 
     def get_video_info(self, file_path: Path) -> VideoInfo:
         try:
-            probe = ffmpeg.probe(str(file_path))
-            video_stream = next((s for s in probe['streams'] if s['codec_type'] == 'video'), None)
+            cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', str(file_path)]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            probe = json.loads(result.stdout)
+            video_stream = next(
+                (s for s in probe['streams'] if s['codec_type'] == 'video'), None)
 
             if video_stream:
                 return VideoInfo(
                     duration=float(probe['format'].get('duration', 0)),
                     color_space=video_stream.get('color_space', 'unknown'),
-                    color_primaries=video_stream.get('color_primaries', 'unknown'),
+                    color_primaries=video_stream.get(
+                        'color_primaries', 'unknown'),
                     color_transfer=video_stream.get('color_trc', 'unknown'),
                     width=video_stream.get('width', 0),
                     height=video_stream.get('height', 0),
                     codec_name=video_stream.get('codec_name', 'unknown')
                 )
-        except ffmpeg.Error as e:
+        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
             self.logger.warning(f"Could not probe {file_path}: {e}")
 
         return VideoInfo()
@@ -103,55 +111,75 @@ class VideoConverter:
     @staticmethod
     def detect_color_profile(video_info: VideoInfo) -> str:
         cs, cp, ct = (video_info.color_space.lower(),
-                     video_info.color_primaries.lower(),
-                     video_info.color_transfer.lower())
+                      video_info.color_primaries.lower(),
+                      video_info.color_transfer.lower())
 
-        if 'dlogm' in cs or 'dlogm' in ct or ('bt709' in cp and 'unknown' in ct):
+        # Detect HLG (iPhone footage)
+        if ('arib-std-b67' in ct or 'hlg' in ct or
+            ('bt2020' in cp and 'arib-std-b67' in ct)):
+            return 'hlg'
+
+        # Detect DLOG-M (DJI footage) - pseudo RAW format
+        if ('dlogm' in cs or 'dlogm' in ct or 'd-log' in cs or 'd-log' in ct or
+            ('bt709' in cp and 'unknown' in ct and video_info.codec_name.lower() in ['h264', 'h265', 'hevc'])):
             return 'dlogm'
+
+        # Standard REC709
         if 'bt709' in cs or 'bt709' in cp or 'bt709' in ct or 'srgb' in ct:
             return 'rec709'
+
         return 'unknown'
 
-    def build_ffmpeg_stream(self, input_path: Path, output_path: Path, color_profile: str):
-        profile_filters = {
-            'dlogm': f"lut3d='{self.lut_file}',zscale=primaries=bt2020:matrix=bt2020nc,format=p010le,zscale=transfer=arib-std-b67",
-            'rec709': "zscale=primaries=bt2020:matrix=bt2020nc,format=p010le,zscale=transfer=arib-std-b67",
-        }
+    def build_ffmpeg_command(self, input_path: Path, output_path: Path, color_profile: str) -> List[str]:
+        # Use custom LUT if specified, otherwise auto-select based on color profile
+        if self.custom_lut_file:
+            lut_file = self.custom_lut_file
+            video_filter = f"lut3d='{lut_file}'"
+            profile_msg = f"{Colors.BLUE}Custom LUT: {lut_file}{Colors.NC}"
+        else:
+            # Auto-select LUT and create filter chain for REC709 output
+            if color_profile == 'dlogm':
+                lut_file = self.dlogm_lut
+                video_filter = f"lut3d='{lut_file}'"
+                profile_msg = f"{Colors.BLUE}DLOG-M → REC709 (via LUT){Colors.NC}"
+            elif color_profile == 'hlg':
+                lut_file = self.hlg_lut
+                video_filter = f"lut3d='{lut_file}'"
+                profile_msg = f"{Colors.BLUE}HLG REC2020 → REC709 (via LUT){Colors.NC}"
+            elif color_profile == 'rec709':
+                video_filter = "scale"
+                profile_msg = f"{Colors.GREEN}Already REC709 - No conversion needed{Colors.NC}"
+            else:
+                # Unknown - default to DLOG-M LUT
+                lut_file = self.dlogm_lut
+                video_filter = f"lut3d='{lut_file}'"
+                profile_msg = f"{Colors.YELLOW}Unknown → Assuming DLOG-M{Colors.NC}"
 
-        video_filter = profile_filters.get(color_profile, profile_filters['dlogm'])
+        print(f"Color Profile: {profile_msg}")
 
-        profile_msgs = {
-            'dlogm': f"{Colors.BLUE}DLogM → REC709 → REC2020{Colors.NC}",
-            'rec709': f"{Colors.BLUE}REC709 → REC2020{Colors.NC}",
-            'unknown': f"{Colors.YELLOW}Unknown → Assuming DLogM{Colors.NC}"
-        }
-        print(f"Color Profile: {profile_msgs.get(color_profile, profile_msgs['unknown'])}")
+        cmd = [
+            'ffmpeg',
+            '-hwaccel', 'videotoolbox',
+            '-i', str(input_path),
+            '-vf', video_filter,
+            '-c:v', 'hevc_videotoolbox',
+            '-pix_fmt', 'yuv420p10le',
+            '-b:v', '20M',
+            '-maxrate', '25M',
+            '-bufsize', '25M',
+            '-c:a', 'copy',
+            '-tag:v', 'hvc1',
+            '-color_primaries', 'bt709',
+            '-color_trc', 'bt709',
+            '-colorspace', 'bt709',
+            '-movflags', '+faststart',
+            '-progress', 'pipe:1',
+            '-nostats',
+            '-y',
+            str(output_path)
+        ]
 
-        stream = (
-            ffmpeg
-            .input(str(input_path), hwaccel='videotoolbox')
-            .filter('scale', video_filter)
-            .output(
-                str(output_path),
-                vcodec='hevc_videotoolbox',
-                pix_fmt='p010le',
-                video_bitrate='20M',
-                maxrate='25M',
-                bufsize='25M',
-                acodec='copy',
-                **{
-                    'tag:v': 'hvc1',
-                    'color_primaries': 'bt2020',
-                    'color_trc': 'arib-std-b67',
-                    'colorspace': 'bt2020nc',
-                    'movflags': '+faststart'
-                }
-            )
-            .global_args('-progress', 'pipe:1', '-nostats')
-            .overwrite_output()
-        )
-
-        return stream
+        return cmd
 
     def show_progress(self, current: int, total: int) -> None:
         width, pct = 50, (current * 100) // total
@@ -165,48 +193,52 @@ class VideoConverter:
             time_sec = time_ms // 1000000
             pct = min(100, (time_sec * 100) // int(duration))
             width = 30
-            bar = '▓' * (pct * width // 100) + '░' * (width - pct * width // 100)
+            bar = '▓' * (pct * width // 100) + '░' * \
+                (width - pct * width // 100)
             speed_txt = f" {Colors.CYAN}{speed:.1f}x{Colors.NC}" if speed else ""
-            print(f"\r{Colors.GREEN}Encoding: {pct}%{Colors.NC} [{bar}]{speed_txt}", end='', flush=True)
+            print(
+                f"\r{Colors.GREEN}Encoding: {pct}%{Colors.NC} [{bar}]{speed_txt}", end='', flush=True)
 
     def convert_video(self, input_path: Path, output_path: Path, color_profile: str) -> bool:
         try:
-            stream = self.build_ffmpeg_stream(input_path, output_path, color_profile)
+            cmd = self.build_ffmpeg_command(
+                input_path, output_path, color_profile)
             video_info = self.get_video_info(input_path)
 
             print(f"{Colors.CYAN}Converting...{Colors.NC}")
 
-            process = stream.run_async(pipe_stdout=True, pipe_stderr=True)
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             last_update = time.time()
 
-            for line in process.stdout:
-                line_str = line.decode('utf-8', errors='ignore')
-                if match := re.search(r'out_time_ms=(\d+)', line_str):
-                    time_ms = int(match.group(1))
-                    speed_match = re.search(r'speed=([0-9.]+)x', line_str)
-                    speed = float(speed_match.group(1)) if speed_match else None
+            if process.stdout:
+                for line in process.stdout:
+                    line_str = line.decode('utf-8', errors='ignore')
+                    if match := re.search(r'out_time_ms=(\d+)', line_str):
+                        time_ms = int(match.group(1))
+                        speed_match = re.search(r'speed=([0-9.]+)x', line_str)
+                        speed = float(speed_match.group(
+                            1)) if speed_match else None
 
-                    if time.time() - last_update >= 0.5:
-                        self.show_encoding_progress(time_ms, video_info.duration, speed)
-                        last_update = time.time()
+                        if time.time() - last_update >= 0.5:
+                            self.show_encoding_progress(
+                                time_ms, video_info.duration, speed)
+                            last_update = time.time()
 
             process.wait()
             print()
             return process.returncode == 0
 
-        except ffmpeg.Error as e:
-            self.logger.error(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
+        except subprocess.CalledProcessError as e:
+            self.logger.error(
+                f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
             return False
         except Exception as e:
             self.logger.error(f"Conversion error: {e}")
             return False
 
     def process_file(self, input_path: Path, idx: int, total: int) -> bool:
-        output_path = (self.output_dir or input_path.parent) / f"{input_path.stem}{self.output_suffix}.mp4"
-
-        if output_path.exists():
-            print(f"{Colors.YELLOW}⚠ Skipping {input_path.name} - exists{Colors.NC}")
-            return True
+        output_path = (self.output_dir or input_path.parent) / \
+            f"{input_path.stem}{self.output_suffix}.mp4"
 
         try:
             input_size = input_path.stat().st_size
@@ -214,7 +246,8 @@ class VideoConverter:
             color_profile = self.detect_color_profile(video_info)
 
             print(f"\n{Colors.PURPLE}{'━' * 61}{Colors.NC}")
-            print(f"{Colors.CYAN}[{idx}/{total}]{Colors.NC} {Colors.YELLOW}{input_path.name}{Colors.NC}")
+            print(
+                f"{Colors.CYAN}[{idx}/{total}]{Colors.NC} {Colors.YELLOW}{input_path.name}{Colors.NC}")
             print(f"{Colors.BLUE}Size:{Colors.NC} {self.format_size(input_size)} | "
                   f"{Colors.BLUE}Duration:{Colors.NC} {self.format_duration(video_info.duration)} | "
                   f"{Colors.BLUE}Res:{Colors.NC} {video_info.width}x{video_info.height}")
@@ -227,7 +260,8 @@ class VideoConverter:
 
             if self.convert_video(input_path, output_path, color_profile):
                 output_size = output_path.stat().st_size
-                ratio = (output_size * 100.0) / input_size if input_size > 0 else 0
+                ratio = (output_size * 100.0) / \
+                    input_size if input_size > 0 else 0
 
                 print(f"{Colors.GREEN}✓ Success!{Colors.NC} "
                       f"{Colors.BLUE}Output:{Colors.NC} {self.format_size(output_size)} ({ratio:.1f}%)")
@@ -260,7 +294,8 @@ class VideoConverter:
 
         if self.stats['input_size'] > 0:
             saved = self.stats['input_size'] - self.stats['output_size']
-            ratio = (self.stats['output_size'] * 100.0) / self.stats['input_size']
+            ratio = (self.stats['output_size'] * 100.0) / \
+                self.stats['input_size']
             print(f"{Colors.BLUE}Input:{Colors.NC} {self.format_size(self.stats['input_size'])} → "
                   f"{Colors.BLUE}Output:{Colors.NC} {self.format_size(self.stats['output_size'])} "
                   f"({ratio:.1f}%) | "
@@ -273,7 +308,8 @@ class VideoConverter:
 
     def run(self) -> int:
         print(f"{Colors.PURPLE}{'═' * 61}{Colors.NC}")
-        print(f"{Colors.PURPLE}{'HLG Hardware Encoding (Apple Silicon)':^61}{Colors.NC}")
+        print(
+            f"{Colors.PURPLE}{'Auto REC709 Color Grading (Apple Silicon)':^61}{Colors.NC}")
         print(f"{Colors.PURPLE}{'═' * 61}{Colors.NC}")
 
         if not self.check_dependencies():
@@ -314,15 +350,15 @@ Installation:
     )
 
     parser.add_argument('-d', '--directory', default='.',
-                       help='Input directory (default: current)')
+                        help='Input directory (default: current)')
     parser.add_argument('-o', '--output',
-                       help='Output directory (default: same as input)')
-    parser.add_argument('-s', '--suffix', default='_HLG_hw',
-                       help='Output suffix (default: _HLG_hw)')
-    parser.add_argument('-l', '--lut', default='DJI_DLogM_to_Rec709.cube',
-                       help='LUT file (default: DJI_DLogM_to_Rec709.cube)')
+                        help='Output directory (default: same as input)')
+    parser.add_argument('-s', '--suffix', default='_REC709',
+                        help='Output suffix (default: _REC709)')
+    parser.add_argument('-l', '--lut',
+                        help='Custom LUT file (optional - auto-selects by default)')
     parser.add_argument('-v', '--verbose', action='store_true',
-                       help='Verbose logging')
+                        help='Verbose logging')
 
     args = parser.parse_args()
 
@@ -330,7 +366,8 @@ Installation:
         logging.getLogger().setLevel(logging.DEBUG)
 
     try:
-        converter = VideoConverter(args.directory, args.output, args.suffix, args.lut)
+        converter = VideoConverter(
+            args.directory, args.output, args.suffix, args.lut)
         return converter.run()
     except KeyboardInterrupt:
         print(f"\n{Colors.YELLOW}Interrupted{Colors.NC}")
